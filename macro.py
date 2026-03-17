@@ -12,9 +12,11 @@
         --times "11:00,12:10" --name 홍길동 --phone 010-1234-5678 --people 2
 
 예약 오픈 규칙:
-    - 14일 전부터 예약 가능
-    - 매일 22:00에 새 날짜 오픈
-    - 예: 4월 11일 예약 → 3월 28일 22:00 오픈
+    - 7일 전부터 예약 가능
+    - 건대점/홍대점: 오후 8시 오픈
+    - 대전점: 오전 10시 오픈
+    - 예: 대전점 4월 11일 → 4월 4일 10:00 오픈
+    - 예: 건대점 4월 11일 → 4월 4일 20:00 오픈
 """
 
 import argparse
@@ -33,8 +35,14 @@ BRANCHES = {
 BASE_URL = "https://play33.kr"
 
 # ── 예약 오픈 규칙 (사이트 JS에서 확인) ──
-RESERVATION_RANGE_DAYS = 14
-RESERVATION_OPEN_TIME = "22:00:00"
+RESERVATION_RANGE_DAYS = 7
+
+# 지점별 오픈 시간
+BRANCH_OPEN_TIMES = {
+    "1": "20:00:00",  # 건대점: 오후 8시
+    "4": "20:00:00",  # 홍대점: 건대점과 동일 (확인 필요)
+    "5": "10:00:00",  # 대전점: 오전 10시
+}
 
 
 def log(msg):
@@ -42,13 +50,14 @@ def log(msg):
     print(f"  [{now}] {msg}")
 
 
-def calc_open_datetime(target_date_str):
+def calc_open_datetime(target_date_str, branch_id):
     """타겟 날짜의 예약 오픈 일시를 계산.
-    예: 2026-04-11 → 14일 전 = 2026-03-28 22:00:00"""
+    건대점: 7일 전 20:00, 대전점: 7일 전 10:00"""
     target = datetime.strptime(target_date_str, "%Y-%m-%d")
     open_date = target - timedelta(days=RESERVATION_RANGE_DAYS)
+    open_time = BRANCH_OPEN_TIMES.get(branch_id, "20:00:00")
     open_dt = datetime.strptime(
-        f"{open_date.strftime('%Y-%m-%d')} {RESERVATION_OPEN_TIME}",
+        f"{open_date.strftime('%Y-%m-%d')} {open_time}",
         "%Y-%m-%d %H:%M:%S",
     )
     return open_dt
@@ -281,9 +290,9 @@ def book_single(page, branch_id, theme_id, date, time_str, name, phone, people, 
     return None
 
 
-def is_date_bookable_now(target_date_str):
+def is_date_bookable_now(target_date_str, branch_id):
     """해당 날짜가 지금 바로 예약 가능한지 (오픈 범위 내인지)"""
-    open_dt = calc_open_datetime(target_date_str)
+    open_dt = calc_open_datetime(target_date_str, branch_id)
     return datetime.now() >= open_dt
 
 
@@ -366,9 +375,9 @@ def setup_interactive():
     pw, browser, page = create_browser()
 
     # 4) 테마 조회 (미래 날짜면 오늘 날짜로 조회)
-    is_future = not is_date_bookable_now(date)
+    is_future = not is_date_bookable_now(date, branch_id)
     if is_future:
-        open_dt = calc_open_datetime(date)
+        open_dt = calc_open_datetime(date, branch_id)
         log(f"미래 날짜! 오픈 예정: {open_dt.strftime('%Y-%m-%d %H:%M:%S')}")
         log("오늘 날짜로 테마 목록을 먼저 조회합니다...")
         themes = load_themes_only(page, branch_id)
@@ -420,7 +429,7 @@ def setup_interactive():
 
     # 7) 요약
     if is_future:
-        open_dt = calc_open_datetime(date)
+        open_dt = calc_open_datetime(date, branch_id)
         remaining = (open_dt - datetime.now()).total_seconds()
         wait_info = f"예 → {open_dt.strftime('%m/%d %H:%M')} (약 {remaining / 3600:.1f}시간 후)"
     else:
@@ -446,7 +455,7 @@ def setup_interactive():
 
     # 8) 오픈 대기 (미래 날짜)
     if is_future:
-        open_dt = calc_open_datetime(date)
+        open_dt = calc_open_datetime(date, branch_id)
         remaining = (open_dt - datetime.now()).total_seconds()
         if remaining > 0:
             log(f"오픈 대기 시작: {open_dt.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -497,10 +506,10 @@ def setup_cli(args):
         sys.exit(1)
 
     times = [t.strip() for t in args.times.split(",")]
-    is_future = not is_date_bookable_now(args.date)
+    is_future = not is_date_bookable_now(args.date, branch_id)
 
     if is_future:
-        open_dt = calc_open_datetime(args.date)
+        open_dt = calc_open_datetime(args.date, branch_id)
         remaining = (open_dt - datetime.now()).total_seconds()
         wait_info = f"{open_dt.strftime('%m/%d %H:%M')} (약 {max(remaining / 3600, 0):.1f}시간 후)"
     else:
@@ -546,7 +555,7 @@ def setup_cli(args):
 
     # 오픈 대기 (미래 날짜)
     if is_future:
-        open_dt = calc_open_datetime(args.date)
+        open_dt = calc_open_datetime(args.date, branch_id)
         remaining = (open_dt - datetime.now()).total_seconds()
         if remaining > 0:
             log(f"오픈 대기: {open_dt.strftime('%Y-%m-%d %H:%M:%S')}")
