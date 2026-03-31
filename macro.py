@@ -132,11 +132,31 @@ def create_browser():
     return p, browser, page
 
 
-def load_reservation_page(page, branch_id, date):
+def load_reservation_page(page, branch_id, date, fast=False):
     """예약 페이지 로드 → 테마 목록 + 시간 버튼 파싱"""
     url = f"{BASE_URL}/reservation?branch={branch_id}&date={date}"
-    page.goto(url, wait_until="domcontentloaded")
-    page.wait_for_load_state("networkidle", timeout=15000)
+
+    # 이전 네비게이션이 진행 중일 수 있으므로 안정화 대기
+    try:
+        page.wait_for_load_state("load", timeout=3000)
+    except Exception:
+        pass
+
+    if fast:
+        for attempt in range(3):
+            try:
+                page.goto(url, wait_until="commit")
+                page.wait_for_selector(".eveReservationButton", timeout=5000)
+                break
+            except Exception as e:
+                if attempt < 2:
+                    log(f"  페이지 로드 재시도 ({attempt + 1}/3): {e}")
+                    page.wait_for_timeout(500)
+                else:
+                    raise
+    else:
+        page.goto(url, wait_until="domcontentloaded")
+        page.wait_for_load_state("networkidle", timeout=15000)
 
     # 테마 목록
     themes = page.evaluate("""
@@ -182,111 +202,205 @@ def load_themes_only(page, branch_id):
 
 
 def book_single(page, branch_id, theme_id, date, time_str, name, phone, people, btn_index):
-    """단일 예약 수행"""
-    log(f"예약 시작: {date} {time_str}")
+    """단일 예약 수행 (버튼 클릭 + 폼 입력 방식, CSRF/세션 안전지향)"""
+    log(f"예약: {time_str}")
     t0 = time.time()
 
-    # STEP 1: 시간 버튼 클릭 (JS 핸들러가 hidden form 채우고 /reservation/create로 제출)
-    page.evaluate(f"""
-    () => {{
-        const buttons = document.querySelectorAll('.eveReservationButton');
-        const btn = buttons[{btn_index}];
-        if (btn) btn.click();
-    }}
-    """)
-
-    page.wait_for_load_state("domcontentloaded", timeout=10000)
-    time.sleep(0.5)
-
-    # 도착 확인
-    current_url = page.url
-    if "/reservation/create" not in current_url:
-        # 버튼 클릭 실패 → 폼 직접 제출
-        log("버튼 클릭 실패, 폼 직접 제출...")
-        page.evaluate(f"""
-        () => {{
-            const form = document.getElementById('eveSubmitForm');
-            if (form) {{
-                form.querySelector('input[name="branch"]').value = '{branch_id}';
-                form.querySelector('input[name="theme"]').value = '{theme_id}';
-                form.querySelector('input[name="date"]').value = '{date}';
-                form.querySelector('input[name="time"]').value = '{time_str}';
-                form.submit();
-            }} else {{
-                // form이 아예 없으면 직접 생성
-                const f = document.createElement('form');
-                f.method = 'POST';
-                f.action = '/reservation/create';
-                const fields = {{branch: '{branch_id}', theme: '{theme_id}', date: '{date}', time: '{time_str}'}};
-                const tokenEl = document.querySelector('input[name="_token"]') || document.querySelector('meta[name="csrf-token"]');
-                if (tokenEl) fields['_token'] = tokenEl.value || tokenEl.content;
-                for (const [k, v] of Object.entries(fields)) {{
-                    const inp = document.createElement('input');
-                    inp.type = 'hidden'; inp.name = k; inp.value = v;
-                    f.appendChild(inp);
+    # STEP 1: 시간 버튼 클릭으로 예약 페이지 진입 (기본 방식)
+    # evaluate()는 내비게이션을 추적하지 않으므로 expect_navigation과 함께 사용
+    try:
+        with page.expect_navigation(timeout=8000, wait_until="domcontentloaded"):
+            clicked = page.evaluate(f"""
+            () => {{
+                const buttons = document.querySelectorAll('.eveReservationButton');
+                const target = buttons[{btn_index}];
+                if (target) {{
+                    target.click();
+                    return true;
                 }}
-                document.body.appendChild(f);
-                f.submit();
+                return false;
             }}
-        }}
-        """)
-        page.wait_for_load_state("domcontentloaded", timeout=10000)
-        time.sleep(0.5)
+            """)
+    except Exception as nav_err:
+        log(f"  [경고] 내비게이션 대기 중 오류: {nav_err}")
+        clicked = False
+
+    if not clicked:
+        log("  [경고] 버튼 클릭 실패: 폼 직접 제출로 대체 시도")
+        try:
+            with page.expect_navigation(timeout=8000, wait_until="domcontentloaded"):
+                page.evaluate(f"""
+                () => {{
+                    const form = document.getElementById('eveSubmitForm');
+                    if (form) {{
+                        form.querySelector('input[name="branch"]').value = '{branch_id}';
+                        form.querySelector('input[name="theme"]').value = '{theme_id}';
+                        form.querySelector('input[name="date"]').value = '{date}';
+                        form.querySelector('input[name="time"]').value = '{time_str}';
+                        form.submit();
+                    }}
+                }}
+                """)
+        except Exception as nav_err:
+            log(f"  [경고] 폼 제출 내비게이션 오류: {nav_err}")
+
+    page.wait_for_selector("input[name='name']", timeout=8000)
+
+    # CSRF 토큰 존재 확인 (실제로 이름입력 페이지에 들어왔으면 보통 토큰이 있다)
+    page.wait_for_timeout(150)
+    csrf_token = page.evaluate("() => document.querySelector('input[name=_token]')?.value || ''")
+    if csrf_token:
+        log("  CSRF 토큰 확인")
+    else:
+        log("  [주의] CSRF 토큰 미확인 (419 가능성) ")
 
     ms1 = f"{(time.time() - t0) * 1000:.0f}ms"
-    log(f"STEP 1: 예약 폼 진입 ({ms1})")
+    log(f"  폼 진입 ({ms1})")
 
-    # STEP 2: 개인정보 입력
+    # STEP 2: 모든 필드 입력 + 동의 체크 + submit
     try:
         page.fill("input[name='name']", name)
         page.fill("input[name='phone']", phone)
     except Exception as e:
-        log(f"입력 필드 오류: {e}")
+        log(f"  입력 필드 채우기 실패: {e}")
 
-    # 인원수 선택 (option value가 "2", "3" 등 숫자 문자열)
+    # 인원 선택
     try:
-        page.select_option("#evePeople", str(people))
-    except Exception:
-        try:
+        if page.query_selector('#evePeople'):
+            page.select_option('#evePeople', str(people))
+        elif page.query_selector("select[name='people']"):
             page.select_option("select[name='people']", str(people))
-        except Exception:
-            log("인원 선택 실패 - 브라우저에서 직접 선택하세요")
-
-    # 동의 체크
-    page.evaluate("""
-    () => {
-        const cb = document.querySelector("input[name='policy']");
-        if (cb && !cb.checked) cb.click();
-    }
-    """)
-
-    ms2 = f"{(time.time() - t0) * 1000:.0f}ms"
-    log(f"STEP 2: 개인정보 입력 완료 ({ms2})")
-
-    # STEP 3: 예약하기 버튼 클릭
-    try:
-        page.click("button:has-text('예약하기')")
-        page.wait_for_load_state("domcontentloaded", timeout=10000)
     except Exception as e:
-        log(f"예약 버튼 클릭 오류: {e}")
+        log(f"  인원 선택 실패: {e}")
+
+    # 개인정보 처리방침 동의 체크 (다양한 셀렉터 시도)
+    try:
+        checked = page.evaluate("""
+        () => {
+            // 1) name 기반 셀렉터 (policy, agree, privacy 등)
+            const nameSelectors = [
+                'input[name="policy"]',
+                'input[name="agree"]',
+                'input[name="privacy"]',
+                'input[name="agreement"]',
+                'input[name="personal"]',
+                'input[name="check"]',
+            ];
+            for (const sel of nameSelectors) {
+                const el = document.querySelector(sel);
+                if (el && el.type === 'checkbox') {
+                    el.checked = true;
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    return `name: ${sel}`;
+                }
+            }
+
+            // 2) 개인정보/동의 텍스트 근처의 체크박스
+            const allCheckboxes = document.querySelectorAll('input[type="checkbox"]');
+            for (const cb of allCheckboxes) {
+                const parent = cb.closest('label, div, li, p, span');
+                const text = parent ? parent.textContent : '';
+                if (text.includes('개인정보') || text.includes('동의') || text.includes('약관') || text.includes('처리방침')) {
+                    cb.checked = true;
+                    cb.dispatchEvent(new Event('change', { bubbles: true }));
+                    return `text: ${text.trim().substring(0, 30)}`;
+                }
+            }
+
+            // 3) 페이지에 체크박스가 하나뿐이면 그걸 체크
+            if (allCheckboxes.length === 1) {
+                allCheckboxes[0].checked = true;
+                allCheckboxes[0].dispatchEvent(new Event('change', { bubbles: true }));
+                return 'only-checkbox';
+            }
+
+            // 4) 모든 체크박스를 체크 (체크 안 된 것만)
+            if (allCheckboxes.length > 0) {
+                allCheckboxes.forEach(cb => {
+                    if (!cb.checked) {
+                        cb.checked = true;
+                        cb.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                });
+                return `all: ${allCheckboxes.length}개`;
+            }
+
+            return null;
+        }
+        """)
+        if checked:
+            log(f"  개인정보 동의 체크 완료 ({checked})")
+        else:
+            log("  [주의] 체크박스를 찾지 못함")
+    except Exception as e:
+        log(f"  동의 체크 실패: {e}")
+
+    # 예약하기 버튼 클릭 (다양한 셀렉터 + 텍스트 매칭)
+    try:
+        clicked_btn = page.evaluate("""
+        () => {
+            // 1) submit 타입 버튼
+            const submitBtn = document.querySelector("button[type='submit'], input[type='submit']");
+            if (submitBtn) {
+                submitBtn.click();
+                return 'submit-type';
+            }
+
+            // 2) "예약" 텍스트가 포함된 버튼/링크
+            const allButtons = document.querySelectorAll('button, a.btn, a[class*="btn"], input[type="button"]');
+            for (const btn of allButtons) {
+                const text = btn.textContent || btn.value || '';
+                if (text.includes('예약') || text.includes('신청') || text.includes('확인') || text.includes('제출')) {
+                    btn.click();
+                    return `text: ${text.trim().substring(0, 20)}`;
+                }
+            }
+
+            // 3) form.submit() fallback
+            const form = document.querySelector('form[action*="reservation"]')
+                      || document.querySelector('form[action*="create"]')
+                      || document.querySelector('form');
+            if (form) {
+                form.submit();
+                return 'form-submit';
+            }
+
+            return null;
+        }
+        """)
+        if clicked_btn:
+            log(f"  예약 버튼 클릭 ({clicked_btn})")
+        else:
+            log("  [경고] 예약 버튼을 찾지 못함")
+    except Exception as e:
+        log(f"  제출 시도 실패: {e}")
+
+
+    # 결과 페이지 대기
+    page.wait_for_load_state("commit", timeout=5000)
 
     total = f"{(time.time() - t0) * 1000:.0f}ms"
     current_url = page.url
-    log(f"STEP 3: 예약 제출 완료 ({total})")
+    log(f"  제출 완료 ({total})")
 
     # 결과 확인
     try:
+        page.wait_for_load_state("domcontentloaded", timeout=3000)
         result_text = page.text_content("body")
+        lc_text = (result_text or "").lower()
         if "완료" in result_text or "confirm" in current_url.lower():
-            log("예약 성공!")
+            log(f"  예약 성공! ({total})")
             return True
-        elif "실패" in result_text:
-            log(f"예약 실패")
+        elif "실패" in result_text or "이미" in result_text:
+            log(f"  예약 실패 ({total})")
             return False
+        elif "419" in result_text or "page expired" in lc_text:
+            log(f"  419 Page Expired 감지 ({total})")
+            return None
     except Exception:
         pass
 
-    log("결과 불확실 - 브라우저에서 확인하세요")
+    log(f"  결과 불확실 ({total}) - 브라우저 확인")
     return None
 
 
@@ -297,9 +411,9 @@ def is_date_bookable_now(target_date_str, branch_id):
 
 
 def run_booking(page, branch_id, theme_id, date, time_strs, name, phone, people):
-    """시간 목록에 대해 순차 예약 수행. 페이지는 이미 예약 페이지에 있어야 함."""
-    # 현재 페이지에서 시간 데이터 파싱
-    _, time_data = load_reservation_page(page, branch_id, date)
+    """시간 목록에 대해 순차 예약 수행."""
+    # 속도 우선으로 페이지 로드
+    _, time_data = load_reservation_page(page, branch_id, date, fast=True)
 
     # 테마에 해당하는 시간 매핑
     theme_time_map = {}
@@ -325,18 +439,34 @@ def run_booking(page, branch_id, theme_id, date, time_strs, name, phone, people)
     for i, time_str in enumerate(bookable):
         if i > 0:
             log("예약 페이지로 복귀...")
-            _, refreshed = load_reservation_page(page, branch_id, date)
+            _, refreshed = load_reservation_page(page, branch_id, date, fast=True)
             for td in refreshed:
                 if str(td.get("theme")) == str(theme_id) and td["time"] == time_str:
                     theme_time_map[time_str] = td
                     break
 
         btn_index = theme_time_map[time_str]["btnIndex"]
-        result = book_single(
-            page, branch_id, theme_id,
-            date, time_str, name, phone, people,
-            btn_index,
-        )
+
+        result = None
+        attempts = 0
+        while attempts < 2 and result is not True and result is not False:
+            result = book_single(
+                page, branch_id, theme_id,
+                date, time_str, name, phone, people,
+                btn_index,
+            )
+            if result is True or result is False:
+                break
+
+            attempts += 1
+            log(f"  재시도 {attempts}/2 (419 or 불확실)")
+            _, refreshed = load_reservation_page(page, branch_id, date, fast=True)
+            for td in refreshed:
+                if str(td.get("theme")) == str(theme_id) and td["time"] == time_str:
+                    theme_time_map[time_str] = td
+                    btn_index = td["btnIndex"]
+                    break
+
         results.append((time_str, result))
 
     return results
@@ -458,32 +588,16 @@ def setup_interactive():
         open_dt = calc_open_datetime(date, branch_id)
         remaining = (open_dt - datetime.now()).total_seconds()
         if remaining > 0:
+            # 대기 중엔 브라우저 끄기 (죽는 문제 방지)
+            browser.close()
+            pw.stop()
             log(f"오픈 대기 시작: {open_dt.strftime('%Y-%m-%d %H:%M:%S')}")
-            # 오픈 3초 전에 페이지 미리 로드 (세션 유지)
-            if remaining > 30:
-                pre_load_at = open_dt - timedelta(seconds=5)
-                # 대기하면서 주기적으로 세션 유지
-                while (pre_load_at - datetime.now()).total_seconds() > 0:
-                    wait_remaining = (pre_load_at - datetime.now()).total_seconds()
-                    if wait_remaining > 60:
-                        log(f"오픈까지 {(open_dt - datetime.now()).total_seconds() / 60:.1f}분...")
-                        time.sleep(min(wait_remaining - 10, 30))
-                    elif wait_remaining > 5:
-                        log(f"오픈까지 {(open_dt - datetime.now()).total_seconds():.0f}초...")
-                        time.sleep(min(wait_remaining - 3, 5))
-                    else:
-                        time.sleep(0.01)
-
-                # 오픈 5초 전: 페이지 새로고침 (세션 워밍업)
-                log("세션 워밍업...")
-                today = datetime.now().strftime("%Y-%m-%d")
-                page.goto(
-                    f"{BASE_URL}/reservation?branch={branch_id}&date={today}",
-                    wait_until="domcontentloaded",
-                )
-
-            # 정확한 오픈 시간까지 정밀 대기
+            log("브라우저는 오픈 직전에 새로 띄웁니다.")
             wait_until(open_dt)
+
+            # 오픈! 브라우저 새로 생성
+            log("브라우저 시작...")
+            pw, browser, page = create_browser()
         else:
             log("이미 오픈된 날짜입니다!")
 
@@ -558,38 +672,16 @@ def setup_cli(args):
         open_dt = calc_open_datetime(args.date, branch_id)
         remaining = (open_dt - datetime.now()).total_seconds()
         if remaining > 0:
+            # 대기 중엔 브라우저 끄기 (죽는 문제 방지)
+            browser.close()
+            pw.stop()
             log(f"오픈 대기: {open_dt.strftime('%Y-%m-%d %H:%M:%S')}")
-
-            # 오픈 5초 전까지 대기 (중간에 세션 유지)
-            while True:
-                remaining = (open_dt - datetime.now()).total_seconds()
-                if remaining <= 5:
-                    break
-                if remaining > 120:
-                    # 2분마다 세션 유지 (페이지 새로고침)
-                    log(f"오픈까지 {remaining / 60:.1f}분... (세션 유지 중)")
-                    today = datetime.now().strftime("%Y-%m-%d")
-                    page.goto(
-                        f"{BASE_URL}/reservation?branch={branch_id}&date={today}",
-                        wait_until="domcontentloaded",
-                    )
-                    time.sleep(min(remaining - 10, 90))
-                elif remaining > 10:
-                    log(f"오픈까지 {remaining:.0f}초...")
-                    time.sleep(min(remaining - 5, 5))
-                else:
-                    time.sleep(0.01)
-
-            # 세션 워밍업
-            log("세션 워밍업...")
-            today = datetime.now().strftime("%Y-%m-%d")
-            page.goto(
-                f"{BASE_URL}/reservation?branch={branch_id}&date={today}",
-                wait_until="domcontentloaded",
-            )
-
-            # 정밀 대기
+            log("브라우저는 오픈 직전에 새로 띄웁니다.")
             wait_until(open_dt)
+
+            # 오픈! 브라우저 새로 생성
+            log("브라우저 시작...")
+            pw, browser, page = create_browser()
     else:
         if not args.auto:
             input("\n  >>> Enter 누르면 매크로 발사!\n")
